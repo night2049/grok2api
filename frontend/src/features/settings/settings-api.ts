@@ -129,6 +129,7 @@ function withSettingsDefaults(snapshot: SettingsSnapshotDTO): SettingsSnapshotDT
       },
       routing: {
         ...snapshot.config.routing,
+        markBuildChatDeniedAsReauth: snapshot.config.routing.markBuildChatDeniedAsReauth ?? false,
         segmentedSelector: {
           enabled: segmentedSelector.enabled ?? false,
           minCandidates: segmentedSelector.minCandidates || 3000,
