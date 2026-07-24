@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { Activity, ArrowDown, ArrowUp, BrainCircuit, CircleCheck, CircleDollarSign, CornerDownRight, Database, Info, Minimize2, RefreshCw, Search, WholeWord, type LucideIcon } from "lucide-react";
-import { memo, useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { Button } from "@/components/ui/button";
@@ -92,9 +92,6 @@ export function RequestAuditsPage() {
   const estimatedCostTicks = summary?.usage.estimatedCostInUsdTicks ?? 0;
   const hasEstimatedCost = (summary?.pricing.pricedRequests ?? 0) > 0;
   const modelOptions = useMemo(() => [...new Map((modelOptionsQuery.data?.items ?? []).map((model) => [model.publicId, { value: model.publicId, label: model.publicId }])).values()], [modelOptionsQuery.data?.items]);
-  const openAudit = useCallback((audit: AuditDTO) => setSelectedAudit(audit), []);
-  const renderAuditRow = useCallback((audit: AuditDTO) => <AuditRow key={audit.id} audit={audit} locale={i18n.language} onOpen={openAudit} />, [i18n.language, openAudit]);
-
   function refreshAll(): void {
     setManualRefreshing(true);
     forceSummaryRefresh.current = true;
@@ -244,28 +241,6 @@ export function RequestAuditsPage() {
     </div>
   );
 }
-
-const AuditRow = memo(function AuditRow({ audit, locale, onOpen }: { audit: AuditDTO; locale: string; onOpen: (audit: AuditDTO) => void }) {
-  return (
-    <TableRow className="h-[72px]">
-      <TableCell><RequestValue audit={audit} /></TableCell>
-      <TableCell>
-        <ModelRouteValue
-          model={audit.modelPublicId || `#${audit.modelRouteId}`}
-          upstreamModel={audit.modelUpstreamModel || "-"}
-          account={audit.accountName || (audit.accountId ? `#${audit.accountId}` : "-")}
-          clientKey={audit.clientKeyName || `#${audit.clientKeyId}`}
-        />
-      </TableCell>
-      <TableCell><EgressValue audit={audit} /></TableCell>
-      <TableCell><BillingValue audit={audit} /></TableCell>
-      <TableCell className="px-3"><UsageDetails audit={audit} locale={locale} /></TableCell>
-      <TableCell className="text-center"><AuditStatus audit={audit} onOpen={() => onOpen(audit)} /></TableCell>
-      <TableCell className="whitespace-nowrap text-xs tabular-nums">{formatDuration(audit.durationMs)}</TableCell>
-      <TableCell className="whitespace-nowrap text-xs text-muted-foreground">{formatDateTime(audit.createdAt, locale)}</TableCell>
-    </TableRow>
-  );
-});
 
 function RequestValue({ audit }: { audit: AuditDTO }) {
   const { t } = useTranslation();
