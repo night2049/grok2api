@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -49,6 +50,10 @@ const billingReservationCrashGrace = 10 * time.Minute
 const mediaBillingReservationTTL = 24 * time.Hour
 const modelCatalogRefreshTimeout = 30 * time.Second
 const accountStateWriteTimeout = 3 * time.Second
+
+// nonAccountFailureFingerprintLimit 仅限制非账号归因故障（网络/5xx 等）。
+// 账号级失败持续换号，避免少量瞬时上游故障过早放弃仍可用的凭证池。
+const nonAccountFailureFingerprintLimit = 16
 
 var freeQuotaUsagePattern = regexp.MustCompile(`(?i)tokens\s*\(actual/limit\)\s*:\s*([0-9]+)\s*/\s*([0-9]+)`)
 
@@ -126,29 +131,30 @@ type accountModelSyncer interface {
 
 // Service handles model routing, account selection, failover, and audit finalization.
 type Service struct {
-	models               routeResolver
-	audits               auditRecorder
-	accounts             *accountapp.Service
-	clientKeys           *clientkeyapp.Service
-	providers            *provider.Registry
-	selector             *Selector
-	responses            repository.ResponseRepository
-	maxAttempts          atomic.Int64
+	models                      routeResolver
+	audits                      auditRecorder
+	accounts                    *accountapp.Service
+	clientKeys                  *clientkeyapp.Service
+	providers                   *provider.Registry
+	selector                    *Selector
+	responses                   repository.ResponseRepository
+	maxAttempts                 atomic.Int64
 	buildForbiddenReauth atomic.Pointer[buildForbiddenReauthPolicy]
 	requestTimeout       atomic.Int64
-	mediaJobs            repository.MediaJobRepository
-	mediaAssets          videoAssetStore
-	mediaQueue           chan string
-	mediaMu              sync.Mutex
-	mediaQueued          map[string]struct{}
-	mediaWorker          int
-	mediaQueueFull       atomic.Uint64
-	logger               *slog.Logger
-	rateLimitMu          sync.Mutex
-	rateLimits           map[string]teamModelRateLimit
-	rateLimitTeams       map[uint64]string
-	modelSyncMu          sync.Mutex
-	modelSyncing         map[uint64]struct{}
+	mediaJobs                   repository.MediaJobRepository
+	mediaAssets                 videoAssetStore
+	mediaQueue                  chan string
+	mediaMu                     sync.Mutex
+	mediaQueued                 map[string]struct{}
+	mediaWorker                 int
+	mediaQueueFull              atomic.Uint64
+	logger                      *slog.Logger
+	rateLimitMu                 sync.Mutex
+	rateLimits                  map[string]teamModelRateLimit
+	rateLimitTeams              map[uint64]string
+	modelSyncMu                 sync.Mutex
+	modelSyncing                map[uint64]struct{}
+	markBuildChatDeniedAsReauth atomic.Bool
 }
 
 type teamModelRateLimit struct {
@@ -301,6 +307,12 @@ func (s *Service) SetLogger(logger *slog.Logger) {
 }
 
 func (s *Service) UpdateMaxAttempts(maxAttempts int) { s.maxAttempts.Store(int64(maxAttempts)) }
+
+// UpdateMarkBuildChatDeniedAsReauth 热更新 Build chat 永久拒绝是否标 reauthRequired。
+// 默认 false：仅模型级冷却；true 时按旧逻辑将账号标为失效并出池。
+func (s *Service) UpdateMarkBuildChatDeniedAsReauth(enabled bool) {
+	s.markBuildChatDeniedAsReauth.Store(enabled)
+}
 
 func (s *Service) UpdateRequestTimeout(value time.Duration) {
 	if value <= 0 {
@@ -569,7 +581,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	}
 	attempts := int(s.maxAttempts.Load())
 	if attempts <= 0 {
-		attempts = 3
+		attempts = 999
 	}
 	idempotencyID, _ := security.NewOpaqueToken(18)
 	if ownership != nil {
@@ -589,6 +601,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	authRecoveryAttempted := make(map[uint64]bool)
 	quotaMode := s.providers.QuotaMode(route.Provider, route.UpstreamModel)
 	quotaProbeAttempted := false
+	var selection *selectionSession
 	var lastErr error
 	var lastFailure *UpstreamFailure
 	failureAttempts := newFailureAttemptRecorder(http.MethodPost, path)
@@ -617,7 +630,12 @@ attemptLoop:
 		if ownership != nil {
 			lease, err = s.selector.AcquirePinned(ctx, route.Provider, ownership.AccountID, route.UpstreamModel, quotaMode, true)
 		} else {
-			lease, err = s.selector.Acquire(ctx, route.Provider, route.UpstreamModel, quotaMode, affinityKey, excluded, !quotaProbeAttempted)
+			if selection == nil {
+				selection, err = s.selector.beginSelectionSession(ctx, route.Provider, route.UpstreamModel, quotaMode, affinityKey, excluded, !quotaProbeAttempted)
+			}
+			if err == nil {
+				lease, err = selection.Acquire(ctx, excluded, !quotaProbeAttempted)
+			}
 		}
 		timing.markSelection(time.Since(selectionStarted))
 		if err != nil {
@@ -643,7 +661,7 @@ attemptLoop:
 		}
 		if lease.QuotaProbeKind == accountdomain.QuotaRecoveryKindPaid {
 			recovered, probeErr := s.accounts.ProbePaidQuota(ctx, lease.Credential)
-			s.selector.MarkQuotaStateChanged(lease.Credential.Provider)
+			s.selector.MarkQuotaStateChanged(lease.Credential.Provider, lease.Credential.ID)
 			if probeErr != nil || !recovered {
 				lease.Release()
 				lastErr = firstError(probeErr, fmt.Errorf("付费额度尚未恢复"))
@@ -674,11 +692,8 @@ attemptLoop:
 				continue
 			}
 			lastFailure = newTransportUpstreamFailure(err, credential.ID, credential.Name)
-			if !isRetryableTransportFailure(credential.Provider, err) {
-				break
-			}
-			failureFingerprints[lastFailure.Fingerprint]++
-			if failureFingerprints[lastFailure.Fingerprint] >= 2 {
+			s.selector.MarkFailure(ctx, credential, 0, 0)
+			if shouldStopForNonAccountFingerprint(failureFingerprints, lastFailure) {
 				break
 			}
 			continue
@@ -730,7 +745,7 @@ attemptLoop:
 			if response.StatusCode == http.StatusUnauthorized {
 				body, _ := readRetryableBody(response.Body)
 				_ = s.accounts.MarkReauthRequired(ctx, credential.ID, "Grok Build OAuth credential rejected after refresh")
-				s.selector.MarkQuotaStateChanged(credential.Provider)
+				s.selector.MarkQuotaStateChanged(credential.Provider, credential.ID)
 				lease.Release()
 				lastErr = fmt.Errorf("刷新后上游仍返回 401")
 				lastFailure = newHTTPUpstreamFailure(http.StatusUnauthorized, body, credential.ID, credential.Name)
@@ -739,12 +754,35 @@ attemptLoop:
 		}
 		egressForbidden := s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden
 		finalEgressForbidden := egressForbidden && (attempt > 0 || attempt+1 >= attempts)
+		// 402/403 personal-team-blocked:spending-limit 在账期内不会自动恢复。
+		// 无论上游是否允许重试（X-Should-Retry），都先标 reauth 出池，避免反复打已废号。
+		if (response.StatusCode == http.StatusPaymentRequired || response.StatusCode == http.StatusForbidden) && credential.Provider == accountdomain.ProviderBuild {
+			body, _ := readRetryableBody(response.Body)
+			failure := newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
+			if failure.SpendingLimitBlocked {
+				_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s spending limit blocked", credential.Provider))
+				s.selector.MarkQuotaStateChanged(credential.Provider, credential.ID)
+				lastFailure = failure
+				lease.Release()
+				lastErr = fmt.Errorf("上游返回 %d", response.StatusCode)
+				s.logger.Warn("upstream_request_failed", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "status", response.StatusCode, "upstream_code", failure.UpstreamCode, "account_scoped", failure.AccountScoped)
+				continue
+			}
+			// 非 spending-limit 的 402/403 仍走原有重试逻辑；body 已读出但未消费，重建 reader。
+			if response.Body != nil {
+				_ = response.Body.Close()
+			}
+			response.Body = io.NopCloser(bytes.NewReader(body))
+		}
 		if isRetryableResponse(response, route.Provider) && !finalEgressForbidden {
 			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
 			body, _ := readRetryableBody(response.Body)
 			if egressForbidden {
 				// Web 403/code 7 means the browser session at the egress was rejected; the Provider rebuilt it and reduced node health, so do not penalize the account.
 				delete(excluded, credential.ID)
+				if selection != nil {
+					selection.RetryAccount(credential.ID)
+				}
 				lease.Release()
 				lastErr = fmt.Errorf("Grok Web 出口会话被反机器人规则拒绝")
 				lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
@@ -806,7 +844,7 @@ attemptLoop:
 				failureHandled = true
 			} else if lease.QuotaMode != "" && response.StatusCode == http.StatusTooManyRequests {
 				exhausted, reconcileErr := s.accounts.ReconcileRateLimit(ctx, credential.ID, lease.QuotaMode, retryAfter)
-				s.selector.MarkQuotaStateChanged(credential.Provider)
+				s.selector.MarkQuotaStateChanged(credential.Provider, credential.ID)
 				failureHandled = reconcileErr == nil && exhausted
 			} else if used, limit, exhausted := parseFreeQuotaExhaustion(body); exhausted {
 				s.selector.MarkFreeQuotaExhausted(ctx, credential, used, limit, quotaRecoveryHints{
@@ -821,6 +859,11 @@ attemptLoop:
 					Billing: lease.Billing, QuotaMode: lease.QuotaMode, RetryAfter: retryAfter,
 				})
 				failureHandled = true
+			} else if lastFailure.SpendingLimitBlocked {
+				// spending-limit 在账期内不会自动恢复，直接标 reauth 出池，避免到期探测反复打已废号。
+				_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s spending limit blocked", credential.Provider))
+				s.selector.MarkQuotaStateChanged(credential.Provider, credential.ID)
+				failureHandled = true
 			} else if lastFailure.QuotaExhausted {
 				s.selector.MarkPaymentQuotaExhausted(ctx, credential, quotaRecoveryHints{
 					Billing: lease.Billing, QuotaMode: lease.QuotaMode, RetryAfter: retryAfter,
@@ -833,9 +876,14 @@ attemptLoop:
 				failureHandled = s.markReauthRequired(ctx, input.RequestID, credential, fmt.Sprintf("%s upstream error code %s matched the invalidation policy", credential.Provider, lastFailure.UpstreamCode))
 			} else if s.providers.SupportsCredentialRefresh(credential.Provider) && lastFailure.PermanentAccountDenial {
 				if credential.Provider == accountdomain.ProviderBuild {
-					// A Build account may lack permission for one chat model while its OAuth credential and video
-					// access remain valid. Isolate this denial to the model; reauthorization is needed only when the credential is rejected.
+					// 默认 model-scoped，视频拒绝时配额/OAuth 仍可能可用。
+					// 开启 markBuildChatDeniedAsReauth 时再额外标 reauth，便于号池摘除。
+					// 同时写入模型 block，避免在候选缓存窗口内本请求再次选中。
 					s.selector.MarkModelAccessDenied(ctx, credential, route.UpstreamModel, retryAfter)
+					if s.markBuildChatDeniedAsReauth.Load() {
+						_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s chat endpoint access denied", credential.Provider))
+						s.selector.MarkQuotaStateChanged(credential.Provider, credential.ID)
+					}
 					failureHandled = true
 				} else {
 					failureHandled = s.markReauthRequired(ctx, input.RequestID, credential, fmt.Sprintf("%s chat endpoint access denied", credential.Provider))
@@ -845,15 +893,15 @@ attemptLoop:
 			}
 			if lastFailure.AccountScoped && !failureHandled {
 				s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
+			} else if !lastFailure.AccountScoped && response.StatusCode >= http.StatusInternalServerError {
+				// 5xx 短冷却：本请求已 excluded，跨请求避免立刻再打同一坏号。
+				s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
 			}
 			lease.Release()
 			lastErr = fmt.Errorf("上游返回 %d", response.StatusCode)
 			s.logger.Warn("upstream_request_failed", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "status", response.StatusCode, "upstream_code", lastFailure.UpstreamCode, "account_scoped", lastFailure.AccountScoped)
-			if !lastFailure.AccountScoped {
-				failureFingerprints[lastFailure.Fingerprint]++
-				if failureFingerprints[lastFailure.Fingerprint] >= 2 {
-					break
-				}
+			if shouldStopForNonAccountFingerprint(failureFingerprints, lastFailure) {
+				break
 			}
 			continue
 		}
@@ -1235,7 +1283,7 @@ func (s *Service) markPermanentlyUnrefreshableCredentialRejected(ctx context.Con
 
 func (s *Service) markCredentialRejectedAfterPermanentRefresh(ctx context.Context, credential accountdomain.Credential) {
 	_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s OAuth access token rejected after permanent refresh failure", credential.Provider))
-	s.selector.MarkQuotaStateChanged(credential.Provider)
+	s.selector.MarkQuotaStateChanged(credential.Provider, credential.ID)
 }
 
 func readRetryableBody(body io.ReadCloser) ([]byte, error) {
@@ -1275,6 +1323,23 @@ func (b *finalizingBody) Close() error {
 		b.finalize()
 	}
 	return err
+}
+
+// shouldStopForNonAccountFingerprint 仅对非账号归因故障累计指纹并在达到阈值后停止换号。
+// 账号级失败（额度、鉴权、冷却等）继续轮询其它凭证。
+// 未知 403、Team 模型限流只跳过当前号，不累计指纹、不提前结束整次请求。
+func shouldStopForNonAccountFingerprint(fingerprints map[string]int, failure *UpstreamFailure) bool {
+	if failure == nil || failure.AccountScoped || failure.Fingerprint == "" {
+		return false
+	}
+	if failure.HTTPStatus == http.StatusForbidden {
+		return false
+	}
+	if failure.Fingerprint == "429:team_model_rate_limit" {
+		return false
+	}
+	fingerprints[failure.Fingerprint]++
+	return fingerprints[failure.Fingerprint] >= nonAccountFailureFingerprintLimit
 }
 
 func isRetryable(status int) bool {

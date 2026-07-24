@@ -29,18 +29,19 @@ const (
 	RecommendedBuildClientVersion = "0.2.110"
 	RecommendedBuildUserAgent     = "grok-shell/" + RecommendedBuildClientVersion + " (linux; x86_64)"
 
-	maxServerBodyBytes    = 256 << 20
-	maxRequestTimeout     = 24 * time.Hour
-	maxReadTimeout        = time.Hour
-	maxRoutingTTL         = 30 * 24 * time.Hour
-	maxRoutingCooldown    = 24 * time.Hour
-	minAuditFlushInterval = 10 * time.Millisecond
-	maxAuditFlushInterval = time.Minute
-	minAuditCommitDelay   = time.Millisecond
-	maxAuditCommitDelay   = 50 * time.Millisecond
-	maxAuditBufferSize    = 262144
-	maxAuditBatchSize     = 4096
-	maxDeploymentReplicas = 1024
+	maxServerBodyBytes     = 256 << 20
+	maxRequestTimeout      = 24 * time.Hour
+	maxReadTimeout         = time.Hour
+	maxRoutingTTL          = 30 * 24 * time.Hour
+	maxRoutingCooldown     = 24 * time.Hour
+	maxRoutingCapacityWait = 30 * time.Second
+	minAuditFlushInterval  = 10 * time.Millisecond
+	maxAuditFlushInterval  = time.Minute
+	maxAuditBufferSize     = 262144
+	maxAuditBatchSize      = 4096
+	minAuditCommitDelay    = time.Millisecond
+	maxAuditCommitDelay    = 50 * time.Millisecond
+	maxDeploymentReplicas  = 1024
 )
 
 var buildForbiddenCodePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
@@ -207,6 +208,8 @@ type RoutingConfig struct {
 	CapacityWait              Duration `yaml:"capacityWait"`
 	MaxAttempts               int      `yaml:"maxAttempts"`
 	PreferFreeBuild           bool     `yaml:"preferFreeBuild"`
+	// MarkBuildChatDeniedAsReauth 为 true 时，Build chat 权限拒绝标 reauthRequired，默认 false。
+	MarkBuildChatDeniedAsReauth bool   `yaml:"markBuildChatDeniedAsReauth"`
 	SegmentedSelectorEnabled  bool     `yaml:"segmentedSelectorEnabled"`
 	SegmentedMinCandidates    int      `yaml:"segmentedSelectorMinCandidates"`
 	SegmentedWindowSize       int      `yaml:"segmentedSelectorWindowSize"`
@@ -526,7 +529,7 @@ func (c Config) Validate() error {
 	if c.Provider.Web.RecoveryBackoffBase.Value() < 5*time.Second || c.Provider.Web.RecoveryBackoffMax.Value() < c.Provider.Web.RecoveryBackoffBase.Value() || c.Provider.Web.RecoveryBackoffMax.Value() > 6*time.Hour {
 		return errors.New("provider.web 恢复退避配置无效")
 	}
-	if c.Routing.StickyTTL.Value() <= 0 || c.Routing.StickyTTL.Value() > maxRoutingTTL || c.Routing.CooldownBase.Value() <= 0 || c.Routing.CooldownMax.Value() < c.Routing.CooldownBase.Value() || c.Routing.CooldownMax.Value() > maxRoutingCooldown || c.Routing.CapacityWait.Value() <= 0 || c.Routing.CapacityWait.Value() > 5*time.Second || c.Routing.MaxAttempts < 1 || c.Routing.MaxAttempts > 10 {
+	if c.Routing.StickyTTL.Value() <= 0 || c.Routing.StickyTTL.Value() > maxRoutingTTL || c.Routing.CooldownBase.Value() <= 0 || c.Routing.CooldownMax.Value() < c.Routing.CooldownBase.Value() || c.Routing.CooldownMax.Value() > maxRoutingCooldown || c.Routing.CapacityWait.Value() <= 0 || c.Routing.CapacityWait.Value() > maxRoutingCapacityWait || c.Routing.MaxAttempts < 1 || c.Routing.MaxAttempts > 65535 {
 		return errors.New("routing 配置无效")
 	}
 	if c.Routing.SegmentedMinCandidates < 100 || c.Routing.SegmentedMinCandidates > 1000000 ||
@@ -614,7 +617,7 @@ func defaultConfig() Config {
 		Server: ServerConfig{
 			Listen:                "127.0.0.1:8000",
 			MaxBodyBytes:          32 << 20,
-			MaxConcurrentRequests: 1024,
+			MaxConcurrentRequests: 2048,
 			ReadTimeout:           Duration(15 * time.Minute),
 			RequestTimeout:        Duration(2 * time.Hour),
 		},
@@ -644,7 +647,7 @@ func defaultConfig() Config {
 				ClearanceMode: ClearanceModeManual, FlareSolverrURL: DefaultFlareSolverrURL,
 				ClearanceTimeout: Duration(time.Minute), ClearanceRefresh: Duration(10 * time.Minute),
 				QuotaTimeout: Duration(25 * time.Second),
-				ChatTimeout:  Duration(2 * time.Minute), ImageTimeout: Duration(3 * time.Minute),
+				ChatTimeout:  Duration(5 * time.Minute), ImageTimeout: Duration(3 * time.Minute),
 				VideoTimeout:     Duration(15 * time.Minute),
 				MediaConcurrency: 4, RecoveryBackoffBase: Duration(30 * time.Second),
 				RecoveryBackoffMax: Duration(30 * time.Minute),
@@ -665,7 +668,8 @@ func defaultConfig() Config {
 			CooldownBase:              Duration(30 * time.Second),
 			CooldownMax:               Duration(30 * time.Minute),
 			CapacityWait:              Duration(500 * time.Millisecond),
-			MaxAttempts:               3,
+			MaxAttempts:               999,
+			MarkBuildChatDeniedAsReauth: false,
 			PreferFreeBuild:           false,
 			SegmentedSelectorEnabled:  false,
 			SegmentedMinCandidates:    3000,

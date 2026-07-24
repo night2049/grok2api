@@ -33,6 +33,8 @@ const concurrencySnapshotTTL = 25 * time.Millisecond
 const maxConcurrencySnapshots = 256
 
 const modelAccessDeniedCooldown = 5 * time.Minute
+// softNetworkCooldown 网络/超时/5xx 仅短暂隔离本号，避免指数冷却掏空热池。
+const softNetworkCooldown = 5 * time.Second
 
 const defaultFreeQuotaRecoveryPause = 24 * time.Hour
 
@@ -240,7 +242,9 @@ func (s *Selector) preferFreeBuildEnabled() bool {
 	return s.preferFreeBuild
 }
 
-func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstreamModel, quotaMode, affinityKey string, excluded map[uint64]bool, allowQuotaProbe bool) (*accountLease, error) {
+// acquireOnce 保留给单次选号调用方；多次故障切换应复用 selectionSession。
+// 公开入口见 selector_session.go 的 Selector.Acquire。
+func (s *Selector) acquireOnce(ctx context.Context, provider account.Provider, upstreamModel, quotaMode, affinityKey string, excluded map[uint64]bool, allowQuotaProbe bool) (*accountLease, error) {
 	now := time.Now().UTC()
 	stickyKey := stickySessionKey(affinityKey)
 	values, err := s.loadCandidates(ctx, provider, upstreamModel, quotaMode, now)
@@ -590,7 +594,7 @@ func (s *Selector) markSuccess(ctx context.Context, credential account.Credentia
 		_ = s.accounts.ClearQuotaRecovery(ctx, credential.ID)
 	}
 	if quotaProbe || credential.FailureCount > 0 || credential.CooldownUntil != nil || credential.LastError != "" {
-		s.invalidateCandidates(credential.Provider)
+		s.evictCandidate(credential.Provider, credential.ID)
 	}
 }
 
@@ -610,7 +614,7 @@ func (s *Selector) markFreeQuotaExhaustedAt(ctx context.Context, credential acco
 		NextProbeAt: &nextProbeAt, LastConfirmedAt: &now, UpdatedAt: now,
 	})
 	_ = s.sticky.DeleteByAccount(ctx, credential.ID)
-	s.invalidateCandidates(credential.Provider)
+	s.evictCandidate(credential.Provider, credential.ID)
 }
 
 func (s *Selector) MarkModelQuotaExhausted(ctx context.Context, credential account.Credential, upstreamModel string, retryAfter time.Duration) {
@@ -626,7 +630,7 @@ func (s *Selector) MarkModelQuotaExhausted(ctx context.Context, credential accou
 	_ = s.accounts.UpsertModelQuotaBlock(ctx, account.ModelQuotaBlock{
 		AccountID: credential.ID, UpstreamModel: upstreamModel, Reason: "model_quota_depleted", CooldownUntil: until, UpdatedAt: time.Now().UTC(),
 	})
-	s.invalidateCandidates(credential.Provider)
+	s.evictCandidate(credential.Provider, credential.ID)
 }
 
 // MarkModelAccessDenied isolates a permission failure to the rejected model.
@@ -645,7 +649,7 @@ func (s *Selector) MarkModelAccessDenied(ctx context.Context, credential account
 		AccountID: credential.ID, UpstreamModel: upstreamModel, Reason: "model_access_denied",
 		CooldownUntil: now.Add(retryAfter), UpdatedAt: now,
 	})
-	s.invalidateCandidates(credential.Provider)
+	s.evictCandidate(credential.Provider, credential.ID)
 }
 
 // MarkPaymentQuotaExhausted 将 402/spending-limit 账号移出号池。付费账号按真实账期
@@ -695,8 +699,17 @@ func (s *Selector) resolveQuotaRecoveryAt(ctx context.Context, accountID uint64,
 	return now.Add(hints.Fallback)
 }
 
-// MarkQuotaStateChanged 在 Billing 探测改变持久化额度状态后立即失效候选快照。
-func (s *Selector) MarkQuotaStateChanged(provider account.Provider) { s.invalidateCandidates(provider) }
+// MarkQuotaStateChanged 在 Billing 探测改变持久化额度状态后更新对应账号的候选快照。
+// 未提供账号 ID 时保留全量失效语义，供无法确定变更范围的调用方使用。
+func (s *Selector) MarkQuotaStateChanged(provider account.Provider, accountIDs ...uint64) {
+	if len(accountIDs) == 0 {
+		s.invalidateCandidates(provider)
+		return
+	}
+	for _, accountID := range accountIDs {
+		s.evictCandidate(provider, accountID)
+	}
+}
 
 // ConsumeQuota 将成功请求的本地额度变化应用到候选快照，避免为单账号变化清空整个 Provider 缓存。
 func (s *Selector) ConsumeQuota(provider account.Provider, accountID uint64, mode string, amount int) {
@@ -750,21 +763,32 @@ func (s *Selector) ConsumeQuota(provider account.Provider, accountID uint64, mod
 }
 
 func (s *Selector) MarkFailure(ctx context.Context, credential account.Credential, status int, retryAfter time.Duration) {
-	failureCount := credential.FailureCount + 1
 	_, cooldownBase, cooldownMax, _ := s.routingConfig()
+	// 网络/超时（status 0）只短隔离本号，不累加失败次数，避免瞬时抖动把号池指数冻空。
+	// 上游返回的 4xx/5xx 仍按原指数冷却：那是上游明确给出的状态，不是本地网络抖动。
+	softNetwork := status == 0
+	failureCount := credential.FailureCount
 	cooldown := cooldownBase
-	for i := 1; i < failureCount && cooldown < cooldownMax; i++ {
-		cooldown *= 2
-	}
-	if cooldown > cooldownMax {
-		cooldown = cooldownMax
-	}
-	if retryAfter > cooldown {
-		cooldown = retryAfter
+	if softNetwork {
+		cooldown = softNetworkCooldown
+		if retryAfter > cooldown {
+			cooldown = retryAfter
+		}
+	} else {
+		failureCount = credential.FailureCount + 1
+		for i := 1; i < failureCount && cooldown < cooldownMax; i++ {
+			cooldown *= 2
+		}
+		if cooldown > cooldownMax {
+			cooldown = cooldownMax
+		}
+		if retryAfter > cooldown {
+			cooldown = retryAfter
+		}
 	}
 	until := time.Now().UTC().Add(cooldown)
 	_ = s.accounts.UpdateHealth(ctx, credential.ID, failureCount, &until, fmt.Sprintf("upstream status %d", status), false)
-	s.invalidateCandidates(credential.Provider)
+	s.evictCandidate(credential.Provider, credential.ID)
 	if status == 401 || status == 402 || status == 403 || status == 429 {
 		_ = s.sticky.DeleteByAccount(ctx, credential.ID)
 	}
@@ -1066,6 +1090,44 @@ func assembleRoutingCandidates(provider account.Provider, bases []account.Routin
 func (s *Selector) invalidateCandidates(provider account.Provider) {
 	s.ApplyInvalidation(repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, Provider: provider})
 	s.ApplyInvalidation(repository.InvalidationEvent{Kind: repository.InvalidationAccountCapabilityChanged, Provider: provider})
+}
+
+// evictCandidate 从当前进程的候选快照中移除一个账号。持久化状态仍由调用方先写入；
+// 下一个缓存周期会以数据库中的新状态重新加载该账号，不会因单账号变化清空整个 Provider。
+func (s *Selector) evictCandidate(provider account.Provider, accountID uint64) {
+	if accountID == 0 {
+		return
+	}
+	s.candidateMu.Lock()
+	defer s.candidateMu.Unlock()
+	for key, snapshot := range s.candidates {
+		if key.provider != provider {
+			continue
+		}
+		// 候选快照会被并发请求的 selectionSession 只读复用；必须 copy-on-write，
+		// 不能复用底层数组，否则会改写正在执行的请求视图。
+		values := make([]account.RoutingCandidate, 0, len(snapshot.values))
+		removed := false
+		for _, candidate := range snapshot.values {
+			if candidate.Credential.ID == accountID {
+				removed = true
+				continue
+			}
+			values = append(values, candidate)
+		}
+		if removed {
+			// also update byAccount index if present
+			if snapshot.byAccount != nil {
+				byAccount := make(map[uint64]int, len(values))
+				for idx, candidate := range values {
+					byAccount[candidate.Credential.ID] = idx
+				}
+				snapshot.byAccount = byAccount
+			}
+			snapshot.values = values
+			s.candidates[key] = snapshot
+		}
+	}
 }
 
 func (s *Selector) claimAccountSlot(ctx context.Context, value account.Credential) (*accountLease, error) {

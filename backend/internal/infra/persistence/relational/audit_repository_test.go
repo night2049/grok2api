@@ -81,6 +81,10 @@ func TestAuditRepositoryBatchAndCursor(t *testing.T) {
 	if err != nil || len(matched) != 1 || matched[0].RequestID != "cursor-3" {
 		t.Fatalf("egress search = %#v, err = %v", matched, err)
 	}
+	byAccount, _, err := repository.ListCursor(ctx, repositorypkg.AuditCursorQuery{Limit: 10, Search: "primary", Sort: sort})
+	if err != nil || len(byAccount) != 1 || byAccount[0].RequestID != "cursor-3" {
+		t.Fatalf("account search = %#v, err = %v", byAccount, err)
+	}
 	second, _, err := repository.ListCursor(ctx, repositorypkg.AuditCursorQuery{Cursor: &repositorypkg.SortCursor{ID: first[len(first)-1].ID, Value: first[len(first)-1].CreatedAt}, Limit: 2, Sort: sort})
 	if err != nil {
 		t.Fatal(err)

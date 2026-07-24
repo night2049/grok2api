@@ -91,14 +91,15 @@ type FrontendConfig struct {
 
 // RoutingConfig 是管理接口使用的路由可编辑输入。
 type RoutingConfig struct {
-	StickyTTL                 string
-	CooldownBase              string
-	CooldownMax               string
-	CapacityWait              string
-	MaxAttempts               int
-	PreferFreeBuild           bool
-	SegmentedSelector         SegmentedSelectorConfig
-	SegmentedSelectorProvided bool
+	StickyTTL                   string
+	CooldownBase                string
+	CooldownMax                 string
+	CapacityWait                string
+	MaxAttempts                 int
+	PreferFreeBuild             bool
+	MarkBuildChatDeniedAsReauth bool
+	SegmentedSelector           SegmentedSelectorConfig
+	SegmentedSelectorProvided   bool
 }
 
 type SegmentedSelectorConfig struct {
@@ -287,12 +288,31 @@ func (s *Service) ReloadPersisted(ctx context.Context) error {
 
 func applyDomainConfig(base config.Config, value settingsdomain.Config) config.Config {
 	// 旧版运行设置没有 Server 字段，反序列化后为零；升级时沿用当前配置默认值。
+	// 历史默认 1024 自动升到 2048，避免热配置锁死旧闸门。
 	if value.Server.MaxConcurrentRequests > 0 {
-		base.Server.MaxConcurrentRequests = value.Server.MaxConcurrentRequests
+		if value.Server.MaxConcurrentRequests == 1024 {
+			base.Server.MaxConcurrentRequests = 2048
+		} else {
+			base.Server.MaxConcurrentRequests = value.Server.MaxConcurrentRequests
+		}
 	}
 	capacityWait := value.Routing.CapacityWait
 	if capacityWait <= 0 {
 		capacityWait = base.Routing.CapacityWait.Value()
+	}
+	chatTimeout := value.ProviderWeb.ChatTimeout
+	// 历史默认 2m 升到 5m。
+	if chatTimeout == 2*time.Minute {
+		chatTimeout = 5 * time.Minute
+	}
+	rpmLimit := value.ClientKeyDefaults.RPMLimit
+	maxConcurrent := value.ClientKeyDefaults.MaxConcurrent
+	// 历史 Client Key 默认 120/8 升到 600/32（仅新建 Key 的默认模板）。
+	if rpmLimit == 120 {
+		rpmLimit = 600
+	}
+	if maxConcurrent == 8 {
+		maxConcurrent = 32
 	}
 	base.Provider.Build = config.BuildProviderConfig{
 		BaseURL: value.ProviderBuild.BaseURL, FallbackBaseURL: config.NormalizeBuildFallbackBaseURL(value.ProviderBuild.FallbackBaseURL),
@@ -324,7 +344,7 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 		StatsigMode: value.ProviderWeb.StatsigMode, StatsigManualValue: value.ProviderWeb.StatsigManualValue, StatsigSignerURL: value.ProviderWeb.StatsigSignerURL,
 		ClearanceMode: clearanceMode, FlareSolverrURL: flareSolverrURL,
 		ClearanceTimeout: config.Duration(clearanceTimeout), ClearanceRefresh: config.Duration(clearanceRefresh),
-		ChatTimeout: config.Duration(value.ProviderWeb.ChatTimeout), ImageTimeout: config.Duration(value.ProviderWeb.ImageTimeout),
+		ChatTimeout: config.Duration(chatTimeout), ImageTimeout: config.Duration(value.ProviderWeb.ImageTimeout),
 		VideoTimeout:     config.Duration(value.ProviderWeb.VideoTimeout),
 		MediaConcurrency: value.ProviderWeb.MediaConcurrency, AllowNSFW: value.ProviderWeb.AllowNSFW,
 		RecoveryBackoffBase: config.Duration(value.ProviderWeb.RecoveryBackoffBase), RecoveryBackoffMax: config.Duration(value.ProviderWeb.RecoveryBackoffMax),
@@ -360,6 +380,7 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 	base.Routing = config.RoutingConfig{
 		StickyTTL: config.Duration(value.Routing.StickyTTL), CooldownBase: config.Duration(value.Routing.CooldownBase),
 		CooldownMax: config.Duration(value.Routing.CooldownMax), CapacityWait: config.Duration(capacityWait), MaxAttempts: value.Routing.MaxAttempts,
+		MarkBuildChatDeniedAsReauth: value.Routing.MarkBuildChatDeniedAsReauth,
 		PreferFreeBuild:          value.Routing.PreferFreeBuild,
 		SegmentedSelectorEnabled: segmentedEnabled,
 		SegmentedMinCandidates:   segmentedMinCandidates,
@@ -378,7 +399,7 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 		LedgerUnhealthyGrace: base.Audit.LedgerUnhealthyGrace, LedgerQueueHighWatermarkPct: base.Audit.LedgerQueueHighWatermarkPct,
 	}
 	base.ClientKeyDefaults = config.ClientKeyDefaultsConfig{
-		RPMLimit: value.ClientKeyDefaults.RPMLimit, MaxConcurrent: value.ClientKeyDefaults.MaxConcurrent,
+		RPMLimit: rpmLimit, MaxConcurrent: maxConcurrent,
 	}
 	// Accounts 为后续新增段；旧持久化缺字段时沿用代码默认（全部关闭）。
 	if value.Accounts.AutoCleanReauthInterval > 0 {
@@ -435,7 +456,8 @@ func toDomainConfig(value config.Config) settingsdomain.Config {
 		Routing: settingsdomain.RoutingConfig{
 			StickyTTL: value.Routing.StickyTTL.Value(), CooldownBase: value.Routing.CooldownBase.Value(),
 			CooldownMax: value.Routing.CooldownMax.Value(), CapacityWait: value.Routing.CapacityWait.Value(), MaxAttempts: value.Routing.MaxAttempts,
-			PreferFreeBuild: value.Routing.PreferFreeBuild,
+			MarkBuildChatDeniedAsReauth: value.Routing.MarkBuildChatDeniedAsReauth,
+		PreferFreeBuild: value.Routing.PreferFreeBuild,
 			SegmentedSelector: &settingsdomain.SegmentedSelectorConfig{
 				ActiveEnabled: value.Routing.SegmentedSelectorEnabled,
 				MinCandidates: value.Routing.SegmentedMinCandidates, WindowSize: value.Routing.SegmentedWindowSize,
@@ -522,6 +544,7 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 		next.Routing.SegmentedMinCandidates = input.Routing.SegmentedSelector.MinCandidates
 		next.Routing.SegmentedWindowSize = input.Routing.SegmentedSelector.WindowSize
 	}
+	next.Routing.MarkBuildChatDeniedAsReauth = input.Routing.MarkBuildChatDeniedAsReauth
 	next.Audit.BufferSize = input.Audit.BufferSize
 	next.Audit.BatchSize = input.Audit.BatchSize
 	if input.Audit.CommitDelayMS > 0 {
@@ -627,7 +650,8 @@ func toEditable(cfg config.Config) EditableConfig {
 		Routing: RoutingConfig{
 			StickyTTL: cfg.Routing.StickyTTL.String(), CooldownBase: cfg.Routing.CooldownBase.String(),
 			CooldownMax: cfg.Routing.CooldownMax.String(), CapacityWait: cfg.Routing.CapacityWait.String(), MaxAttempts: cfg.Routing.MaxAttempts,
-			PreferFreeBuild: cfg.Routing.PreferFreeBuild,
+			MarkBuildChatDeniedAsReauth: cfg.Routing.MarkBuildChatDeniedAsReauth,
+		PreferFreeBuild: cfg.Routing.PreferFreeBuild,
 			SegmentedSelector: SegmentedSelectorConfig{
 				Enabled: cfg.Routing.SegmentedSelectorEnabled, MinCandidates: cfg.Routing.SegmentedMinCandidates,
 				WindowSize: cfg.Routing.SegmentedWindowSize,

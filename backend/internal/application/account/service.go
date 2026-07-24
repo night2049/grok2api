@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,32 +41,36 @@ var (
 var ErrCredentialRefreshPermanent = errors.New("OAuth refresh token 已永久失效")
 
 const (
-	estimatedFreeTokenLimit      int64         = 1_000_000
-	freeUsageWindow              time.Duration = 24 * time.Hour
-	forcedRefreshMinInterval     time.Duration = 30 * time.Second
-	paidProbeRetryInterval       time.Duration = 15 * time.Minute
-	credentialRefreshAdvance     time.Duration = 3 * time.Minute
-	credentialRefreshSafetyPoll  time.Duration = time.Minute
-	credentialRefreshTimeout     time.Duration = 30 * time.Second
-	credentialRefreshStateTTL    time.Duration = 5 * time.Second
-	credentialStateWriteTimeout  time.Duration = 5 * time.Second
-	credentialRefreshBatchSize                 = 100
-	managedTaskWorkerCeiling                   = 50
-	webQuotaRefreshQueueSize                   = 4096
-	webQuotaRefreshTimeout                     = 30 * time.Second
+	estimatedFreeTokenLimit     int64         = 1_000_000
+	freeUsageWindow             time.Duration = 24 * time.Hour
+	forcedRefreshMinInterval    time.Duration = 30 * time.Second
+	paidProbeRetryInterval      time.Duration = 15 * time.Minute
+	credentialRefreshAdvance    time.Duration = 3 * time.Minute
+	credentialRefreshSafetyPoll time.Duration = time.Minute
+	credentialRefreshTimeout    time.Duration = 30 * time.Second
+	credentialRefreshStateTTL   time.Duration = 5 * time.Second
+	credentialStateWriteTimeout time.Duration = 5 * time.Second
+	credentialRefreshBatchSize                = 100
+	managedTaskWorkerCeiling                  = 50
+	webQuotaRefreshQueueSize                  = 4096
+	webQuotaRefreshTimeout                    = 30 * time.Second
 	webQuotaRefreshDirtyTTL                    = 24 * time.Hour
 	webQuotaRefreshRetryInterval               = 500 * time.Millisecond
 	webQuotaRefreshSharedPoll                  = time.Second
 	observedModelPersistInterval               = 30 * time.Minute
 	observedModelLocalCacheTTL                 = 5 * time.Second
 	observedModelLockShards                    = 64
-	maxCredentialExportAccounts                = 10000
-	maxCredentialImportAccounts                = 10000
-	credentialImportChunkSize                  = 100
-	maxBuildConversionAccounts                 = 1000
-	maxWebConsoleSyncAccounts                  = 1000
-	accountTaskBatchSize                       = 1000
-	buildBotFlagCacheTTL         time.Duration = 30 * time.Second
+	maxCredentialExportAccounts               = 10000
+	maxCredentialImportAccounts               = 10000
+	credentialImportChunkSize                 = 100
+	maxBuildConversionAccounts                = 1000
+	maxWebConsoleSyncAccounts                 = 1000
+	accountTaskBatchSize                      = 1000
+	buildBotFlagCacheTTL        time.Duration = 30 * time.Second
+	// buildDetectModel 管理端「检测账号」固定使用的 Grok Build 模型。
+	buildDetectModel = "grok-4.5"
+	// buildDetectPrompt 探测请求正文，仅用于验证凭据与上游可用性。
+	buildDetectPrompt = "hello,test"
 )
 
 const permanentRefreshExpiredReason = "OAuth refresh token 已永久失效且 access token 已过期"
@@ -200,6 +206,31 @@ type ImportedAccountObserver func(accountID uint64) error
 // BatchProgressObserver 在单个账号任务结束后报告批次完成数。
 type BatchProgressObserver func(completed, total int) error
 
+// BuildDetectOutcome 描述单次 Grok Build 可用性探测结果。
+type BuildDetectOutcome string
+
+const (
+	// BuildDetectOutcomeOK 表示探测成功，账号可用。
+	BuildDetectOutcomeOK BuildDetectOutcome = "ok"
+	// BuildDetectOutcomeInvalid 表示已确认失效并标 reauthRequired。
+	BuildDetectOutcomeInvalid BuildDetectOutcome = "invalid"
+	// BuildDetectOutcomeFailed 表示探测失败但未判定为永久失效（网络/5xx/临时额度等）。
+	BuildDetectOutcomeFailed BuildDetectOutcome = "failed"
+)
+
+// BuildDetectItemResult 是单账号探测的结构化结果，供 SSE 增量推送。
+type BuildDetectItemResult struct {
+	AccountID  uint64
+	Name       string
+	Email      string
+	Outcome    BuildDetectOutcome
+	Reason     string
+	HTTPStatus int
+}
+
+// BuildDetectItemObserver 在单个账号探测完成后推送明细；返回错误会取消批次。
+type BuildDetectItemObserver func(item BuildDetectItemResult) error
+
 type ExportResult struct {
 	Data  []byte
 	Count int
@@ -311,6 +342,8 @@ type Service struct {
 	conversionPool        *batch.Pool
 	syncPool              *batch.Pool
 	refreshPool           *batch.Pool
+	// detectPool 专用于管理端「检测账号」，与额度同步/续期隔离，默认并发 32。
+	detectPool            *batch.Pool
 	credentialRefreshWake chan struct{}
 	autoCleanMu           sync.RWMutex
 	autoClean             AutoCleanConfig
@@ -370,8 +403,9 @@ func NewService(accounts repository.AccountRepository, audits repository.AuditRe
 		},
 		autoCleanWake:     make(chan struct{}, 1),
 		buildBotFlagCache: resultcache.New[string, []uint64](1, buildBotFlagCacheTTL),
-		conversionPool:    batch.NewPool(25), syncPool: batch.NewPool(25), refreshPool: batch.NewPool(25), logger: slog.Default(),
-		now: func() time.Time { return time.Now().UTC() },
+		conversionPool: batch.NewPool(25), syncPool: batch.NewPool(25), refreshPool: batch.NewPool(25), detectPool: batch.NewPool(32),
+		logger: slog.Default(),
+		now:    func() time.Time { return time.Now().UTC() },
 	}
 }
 
@@ -391,6 +425,13 @@ func (s *Service) SetTaskPools(conversion, syncPool, refresh *batch.Pool) {
 	}
 	if refresh != nil {
 		s.refreshPool = refresh
+	}
+}
+
+// SetDetectPool 绑定管理端「检测账号」专用并发池；nil 时保留现有池。
+func (s *Service) SetDetectPool(pool *batch.Pool) {
+	if pool != nil {
+		s.detectPool = pool
 	}
 }
 
@@ -2789,6 +2830,290 @@ func (s *Service) BatchRefreshBilling(ctx context.Context, ids []uint64) (int, i
 		return 0, 0, err
 	}
 	return s.refreshBillings(ctx, values, nil)
+}
+
+// DetectBuildAccounts 对指定 Grok Build 账号发起一次 grok-4.5 探测请求；ids 为空时检测全部启用账号。
+func (s *Service) DetectBuildAccounts(ctx context.Context, ids []uint64) (int, int, error) {
+	return s.DetectBuildAccountsWithProgress(ctx, ids, nil, nil)
+}
+
+// DetectBuildAccountsWithProgress 与 DetectBuildAccounts 相同，并上报批量进度与单账号明细。
+// itemObserver 在每个账号完成后调用：选中检测会推送全部结果，全量检测仅推送已确认失效账号。
+func (s *Service) DetectBuildAccountsWithProgress(ctx context.Context, ids []uint64, progress BatchProgressObserver, itemObserver BuildDetectItemObserver) (int, int, error) {
+	if s.providers == nil {
+		return 0, 0, fmt.Errorf("Provider 注册表未初始化")
+	}
+	selectedMode := len(ids) > 0
+	var err error
+	if !selectedMode {
+		ids, err = s.accounts.ListEnabledAccountIDs(ctx, accountdomain.ProviderBuild, false)
+		if err != nil {
+			return 0, 0, err
+		}
+	} else {
+		ids, err = normalizeBatchIDs(ids)
+		if err != nil {
+			return 0, 0, err
+		}
+	}
+	if len(ids) == 0 {
+		return 0, 0, nil
+	}
+	pool := s.detectPool
+	if pool == nil {
+		pool = s.syncPool
+	}
+	if progress != nil {
+		if err := progress(0, len(ids)); err != nil {
+			return 0, 0, err
+		}
+	}
+	var progressMu sync.Mutex
+	var progressErr error
+	completed := 0
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results, summary, err := batch.MapObserved(runCtx, ids, batch.Options{Workers: pool.Limit(), Pool: pool}, func(workCtx context.Context, id uint64) (BuildDetectItemResult, error) {
+		item := s.detectBuildAccount(workCtx, id)
+		if itemObserver != nil && (selectedMode || item.Outcome == BuildDetectOutcomeInvalid) {
+			if notifyErr := itemObserver(item); notifyErr != nil {
+				return item, notifyErr
+			}
+		}
+		if item.Outcome == BuildDetectOutcomeOK {
+			return item, nil
+		}
+		if item.Reason != "" {
+			return item, fmt.Errorf("%s", item.Reason)
+		}
+		return item, fmt.Errorf("账号检测失败")
+	}, func(_ int, _ batch.Result[BuildDetectItemResult]) {
+		progressMu.Lock()
+		defer progressMu.Unlock()
+		completed++
+		if progress != nil {
+			if notifyErr := progress(completed, len(ids)); notifyErr != nil && progressErr == nil {
+				progressErr = notifyErr
+				cancel()
+			}
+		}
+	})
+	for index, result := range results {
+		var panicErr *batch.PanicError
+		if errors.As(result.Err, &panicErr) {
+			s.logger.Error("account_bulk_task_panicked", "operation", "build_detect", "account_id", ids[index], "error", panicErr, "stack", string(panicErr.Stack))
+		}
+	}
+	s.logBatchSummary("build_detect", pool, summary, err)
+	return summary.Succeeded, summary.Failed, errors.Join(err, progressErr)
+}
+
+// detectBuildAccount 使用现有 Build Responses 链路发送固定探测请求。
+// 失效判定复用 provider.ClassifyCredentialRejection，并额外将 spending-limit 与
+// PermanentAccountDenial 标 reauthRequired，便于管理端清理死号。
+func (s *Service) detectBuildAccount(ctx context.Context, id uint64) BuildDetectItemResult {
+	item := BuildDetectItemResult{AccountID: id, Outcome: BuildDetectOutcomeFailed}
+	value, err := s.accounts.Get(ctx, id)
+	if err != nil {
+		item.Reason = mapRepositoryError(err).Error()
+		return item
+	}
+	item.Name = value.Name
+	item.Email = value.Email
+	if value.Provider != accountdomain.ProviderBuild {
+		item.Reason = "仅 Grok Build 账号支持可用性检测"
+		return item
+	}
+	value, err = s.EnsureCredential(ctx, value, false)
+	if err != nil {
+		return s.finishBuildDetectCredentialError(ctx, value, err)
+	}
+	billing, err := s.loadDetectBilling(ctx, id)
+	if err != nil {
+		item.Reason = err.Error()
+		return item
+	}
+	response, err := s.forwardBuildDetect(ctx, value, billing)
+	if err != nil {
+		return s.finishBuildDetectCredentialError(ctx, value, err)
+	}
+	if response.StatusCode == http.StatusUnauthorized {
+		_ = response.Body.Close()
+		return s.handleBuildDetectUnauthorized(ctx, value, billing)
+	}
+	return s.finishBuildDetectResponse(response, value)
+}
+
+// handleBuildDetectUnauthorized 复用网关对 Build OAuth 401 的恢复与失效收敛路径。
+func (s *Service) handleBuildDetectUnauthorized(ctx context.Context, value accountdomain.Credential, billing *accountdomain.Billing) BuildDetectItemResult {
+	item := BuildDetectItemResult{AccountID: value.ID, Name: value.Name, Email: value.Email, Outcome: BuildDetectOutcomeFailed, HTTPStatus: http.StatusUnauthorized}
+	if value.RefreshPermanent {
+		reason := fmt.Sprintf("%s OAuth access token rejected after permanent refresh failure", value.Provider)
+		if markErr := s.markBuildDetectReauth(ctx, value.ID, reason); markErr != nil {
+			item.Reason = markErr.Error()
+			return item
+		}
+		item.Outcome = BuildDetectOutcomeInvalid
+		item.Reason = reason
+		return item
+	}
+	refreshed, refreshErr := s.EnsureCredential(ctx, value, true)
+	if refreshErr != nil {
+		if errors.Is(refreshErr, ErrCredentialRefreshPermanent) {
+			reason := fmt.Sprintf("%s OAuth access token rejected after permanent refresh failure", value.Provider)
+			if markErr := s.markBuildDetectReauth(ctx, value.ID, reason); markErr != nil {
+				item.Reason = errors.Join(refreshErr, markErr).Error()
+				return item
+			}
+			item.Outcome = BuildDetectOutcomeInvalid
+			item.Reason = reason
+			return item
+		}
+		return s.finishBuildDetectCredentialError(ctx, value, refreshErr)
+	}
+	response, err := s.forwardBuildDetect(ctx, refreshed, billing)
+	if err != nil {
+		return s.finishBuildDetectCredentialError(ctx, refreshed, err)
+	}
+	if response.StatusCode == http.StatusUnauthorized {
+		drainDetectBody(response.Body)
+		_ = response.Body.Close()
+		reason := "Grok Build OAuth credential rejected after refresh"
+		if markErr := s.markBuildDetectReauth(ctx, refreshed.ID, reason); markErr != nil {
+			item.Reason = markErr.Error()
+			return item
+		}
+		item.AccountID = refreshed.ID
+		item.Name = refreshed.Name
+		item.Email = refreshed.Email
+		item.Outcome = BuildDetectOutcomeInvalid
+		item.Reason = reason
+		return item
+	}
+	return s.finishBuildDetectResponse(response, refreshed)
+}
+
+func (s *Service) finishBuildDetectCredentialError(ctx context.Context, value accountdomain.Credential, err error) BuildDetectItemResult {
+	item := BuildDetectItemResult{
+		AccountID: value.ID,
+		Name:      value.Name,
+		Email:     value.Email,
+		Outcome:   BuildDetectOutcomeFailed,
+		Reason:    err.Error(),
+	}
+	if rejection := provider.ClassifyCredentialRejection(0, nil, err); rejection.Rejected {
+		reason := fmt.Sprintf("%s OAuth credential rejected", value.Provider)
+		if markErr := s.markBuildDetectReauth(ctx, value.ID, reason); markErr != nil {
+			item.Reason = errors.Join(err, markErr).Error()
+			return item
+		}
+		item.Outcome = BuildDetectOutcomeInvalid
+		item.Reason = reason
+	}
+	return item
+}
+
+func (s *Service) loadDetectBilling(ctx context.Context, id uint64) (*accountdomain.Billing, error) {
+	snap, err := s.accounts.GetBilling(ctx, id)
+	if err == nil {
+		return &snap, nil
+	}
+	if errors.Is(err, repository.ErrNotFound) {
+		return nil, nil
+	}
+	return nil, err
+}
+
+func (s *Service) forwardBuildDetect(ctx context.Context, value accountdomain.Credential, billing *accountdomain.Billing) (*provider.Response, error) {
+	adapter, ok := s.providers.Responses(accountdomain.ProviderBuild)
+	if !ok {
+		return nil, fmt.Errorf("Provider %s 未注册 Responses 能力", accountdomain.ProviderBuild)
+	}
+	body := []byte(fmt.Sprintf(`{"model":%q,"input":%q}`, buildDetectModel, buildDetectPrompt))
+	return adapter.ForwardResponse(ctx, provider.ResponseResourceRequest{
+		Credential:    value,
+		Billing:       billing,
+		Method:        http.MethodPost,
+		Path:          "/responses",
+		Model:         buildDetectModel,
+		Body:          body,
+		NormalizeBody: true,
+		Streaming:     false,
+	})
+}
+
+// markBuildDetectReauth 与 markSSOCredentialRejected 一样不继承客户端取消，确保已确认失效的账号落库。
+func (s *Service) markBuildDetectReauth(ctx context.Context, id uint64, reason string) error {
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), credentialStateWriteTimeout)
+	defer cancel()
+	if err := s.MarkReauthRequired(writeCtx, id, reason); err != nil {
+		s.logger.Error("account_reauth_required_write_failed", "account_id", id, "provider", accountdomain.ProviderBuild, "error", err)
+		return err
+	}
+	return nil
+}
+
+func (s *Service) finishBuildDetectResponse(response *provider.Response, credential accountdomain.Credential) BuildDetectItemResult {
+	item := BuildDetectItemResult{
+		AccountID:  credential.ID,
+		Name:       credential.Name,
+		Email:      credential.Email,
+		Outcome:    BuildDetectOutcomeFailed,
+		HTTPStatus: response.StatusCode,
+	}
+	if response.Body != nil {
+		defer response.Body.Close()
+	}
+	body := readDetectBodyForClassification(response.Body)
+	rejection := provider.ClassifyCredentialRejection(response.StatusCode, body, nil)
+	// detect 采用 v3.0.1 语义：PermanentAccountDenial（403 permission-denied /
+	// "Access to the chat endpoint is denied"）同样标 reauth，方便管理员清理
+	// 已被上游拒绝访问的账号。这与当前网关真实请求路径的 model-scoped 冷却不同，
+	// 因为 detect 是管理端一次性探测，目标是暴露失效账号而非维持号池调度。
+	// SpendingLimitBlocked（402/403 personal-team-blocked:spending-limit）与网关一致直接出池。
+	if rejection.Rejected || rejection.PermanentAccountDenial || rejection.SpendingLimitBlocked {
+		reason := fmt.Sprintf("%s OAuth credential rejected (HTTP %d)", credential.Provider, response.StatusCode)
+		switch {
+		case rejection.SpendingLimitBlocked:
+			reason = fmt.Sprintf("%s spending limit blocked", credential.Provider)
+		case rejection.PermanentAccountDenial:
+			reason = fmt.Sprintf("%s chat endpoint access denied", credential.Provider)
+		}
+		if markErr := s.markBuildDetectReauth(context.Background(), credential.ID, reason); markErr != nil {
+			item.Reason = markErr.Error()
+			return item
+		}
+		item.Outcome = BuildDetectOutcomeInvalid
+		item.Reason = reason
+		return item
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		item.Reason = fmt.Sprintf("上游检测失败: HTTP %d", response.StatusCode)
+		return item
+	}
+	item.Outcome = BuildDetectOutcomeOK
+	item.Reason = ""
+	return item
+}
+
+// readDetectBodyForClassification 读取响应正文用于凭据拒绝分类，最多 64 KiB。
+// 返回的副本供 ClassifyCredentialRejection 解析；body 读完后会被消耗，调用方不应再使用。
+func readDetectBodyForClassification(body io.ReadCloser) []byte {
+	if body == nil {
+		return nil
+	}
+	data, err := io.ReadAll(io.LimitReader(body, 64*1024))
+	if err != nil {
+		return nil
+	}
+	return data
+}
+
+func drainDetectBody(body io.ReadCloser) {
+	if body == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, 1<<20))
 }
 
 // BatchRefreshQuota 使用有限并发同步选中 Web 或 Console 账号的额度窗口。

@@ -41,6 +41,7 @@ func TestTransportUpstreamFailureClassifiesResponseHeaderTimeout(t *testing.T) {
 func TestHTTPUpstreamFailureClassifiesBuildForbiddenBodies(t *testing.T) {
 	tests := []struct {
 		name                   string
+		status                 int
 		body                   string
 		accountScoped          bool
 		permanentAccountDenial bool
@@ -48,38 +49,86 @@ func TestHTTPUpstreamFailureClassifiesBuildForbiddenBodies(t *testing.T) {
 		freeQuotaExhausted     bool
 		modelQuotaExhausted    bool
 		accountBlocked         bool
+		spendingLimitBlocked   bool
 		upstreamCode           string
 	}{
 		{
-			name: "blocked account", body: `{"code":"unauthorized:blocked-user","error":"User is blocked"}`,
+			name: "blocked account", status: http.StatusForbidden, body: `{"code":"unauthorized:blocked-user","error":"User is blocked"}`,
 			accountScoped: true, accountBlocked: true, upstreamCode: "unauthorized:blocked-user",
 		},
 		{
-			name: "top-level permanent chat denial", body: `{"status_code":403,"code":"permission-denied","error":"Access to the chat endpoint is denied. Please update the permissions."}`,
+			name: "top-level permanent chat denial", status: http.StatusForbidden, body: `{"status_code":403,"code":"permission-denied","error":"Access to the chat endpoint is denied. Please update the permissions."}`,
 			accountScoped: true, permanentAccountDenial: true, upstreamCode: "permission-denied",
 		},
 		{
-			name: "spending limit", body: `{"code":"personal-team-blocked:spending-limit","error":"quota exhausted"}`,
-			accountScoped: true, quotaExhausted: true, upstreamCode: "personal-team-blocked:spending-limit",
+			name: "403 spending limit", status: http.StatusForbidden, body: `{"code":"personal-team-blocked:spending-limit","error":"quota exhausted"}`,
+			accountScoped: true, quotaExhausted: true, spendingLimitBlocked: true, upstreamCode: "personal-team-blocked:spending-limit",
 		},
 		{
-			name: "unknown policy rejection", body: `{"error":"upstream policy rejected request"}`,
+			name: "402 spending limit", status: http.StatusPaymentRequired, body: `{"code":"personal-team-blocked:spending-limit","error":"quota exhausted"}`,
+			accountScoped: true, quotaExhausted: true, spendingLimitBlocked: true, upstreamCode: "personal-team-blocked:spending-limit",
 		},
 		{
-			name: "free model quota", body: `{"error":"You've used all the included free usage for model grok-build"}`,
+			name: "unknown policy rejection", status: http.StatusForbidden, body: `{"error":"upstream policy rejected request"}`,
+		},
+		{
+			name: "free model quota", status: http.StatusForbidden, body: `{"error":"You've used all the included free usage for model grok-build"}`,
 			accountScoped: true, quotaExhausted: true, freeQuotaExhausted: true, modelQuotaExhausted: true,
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			failure := newHTTPUpstreamFailure(http.StatusForbidden, []byte(test.body), 42, "build")
-			if failure.HTTPStatus != http.StatusForbidden || failure.Code != "upstream_forbidden" || failure.AccountScoped != test.accountScoped || failure.AccountBlocked != test.accountBlocked || failure.PermanentAccountDenial != test.permanentAccountDenial || failure.QuotaExhausted != test.quotaExhausted || failure.FreeQuotaExhausted != test.freeQuotaExhausted || failure.ModelQuotaExhausted != test.modelQuotaExhausted || failure.UpstreamCode != test.upstreamCode {
+			status := test.status
+			if status == 0 {
+				status = http.StatusForbidden
+			}
+			failure := newHTTPUpstreamFailure(status, []byte(test.body), 42, "build")
+			if failure.HTTPStatus != status || failure.AccountScoped != test.accountScoped || failure.AccountBlocked != test.accountBlocked || failure.PermanentAccountDenial != test.permanentAccountDenial || failure.QuotaExhausted != test.quotaExhausted || failure.FreeQuotaExhausted != test.freeQuotaExhausted || failure.ModelQuotaExhausted != test.modelQuotaExhausted || failure.SpendingLimitBlocked != test.spendingLimitBlocked || failure.UpstreamCode != test.upstreamCode {
 				t.Fatalf("failure = %#v", failure)
 			}
 			if test.upstreamCode == "permission-denied" && (failure.ClientCredentialErrorCode() != "permission-denied" || failure.AuditCode() != "upstream_forbidden_permission_denied") {
 				t.Fatalf("public=%q audit=%q", failure.ClientCredentialErrorCode(), failure.AuditCode())
 			}
 		})
+	}
+}
+
+func TestNonAccountFailureFingerprintStopsAtLimit(t *testing.T) {
+	fingerprints := map[string]int{}
+	accountScoped := &UpstreamFailure{AccountScoped: true, Fingerprint: "429:quota"}
+	if shouldStopForNonAccountFingerprint(fingerprints, accountScoped) {
+		t.Fatal("account-scoped failures must keep switching credentials")
+	}
+	if len(fingerprints) != 0 {
+		t.Fatalf("account-scoped failures should not count fingerprints: %#v", fingerprints)
+	}
+
+	// 未知 403、Team 限流不计指纹，应持续换号。
+	unknown403 := &UpstreamFailure{HTTPStatus: http.StatusForbidden, Fingerprint: "403:unknown"}
+	teamLimit := &UpstreamFailure{HTTPStatus: http.StatusTooManyRequests, Fingerprint: "429:team_model_rate_limit"}
+	for i := 0; i < nonAccountFailureFingerprintLimit+5; i++ {
+		if shouldStopForNonAccountFingerprint(fingerprints, unknown403) {
+			t.Fatalf("unknown 403 must not stop at iteration %d", i)
+		}
+		if shouldStopForNonAccountFingerprint(fingerprints, teamLimit) {
+			t.Fatalf("team rate limit must not stop at iteration %d", i)
+		}
+	}
+	if len(fingerprints) != 0 {
+		t.Fatalf("excluded failure types should not count fingerprints: %#v", fingerprints)
+	}
+
+	network := &UpstreamFailure{Fingerprint: "upstream_timeout"}
+	for i := 1; i < nonAccountFailureFingerprintLimit; i++ {
+		if shouldStopForNonAccountFingerprint(fingerprints, network) {
+			t.Fatalf("stopped early at count %d", i)
+		}
+	}
+	if !shouldStopForNonAccountFingerprint(fingerprints, network) {
+		t.Fatalf("should stop after %d non-account failures", nonAccountFailureFingerprintLimit)
+	}
+	if fingerprints["upstream_timeout"] != nonAccountFailureFingerprintLimit {
+		t.Fatalf("fingerprint count = %d, want %d", fingerprints["upstream_timeout"], nonAccountFailureFingerprintLimit)
 	}
 }
 

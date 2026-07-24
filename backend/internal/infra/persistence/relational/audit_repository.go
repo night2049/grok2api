@@ -675,7 +675,7 @@ func (r *AuditRepository) Summarize(ctx context.Context, input repository.AuditS
 func applyAuditQuery(query *gorm.DB, search string, start, end time.Time, filter repository.AuditListFilter) *gorm.DB {
 	if value := strings.TrimSpace(search); value != "" {
 		pattern := "%" + strings.ToLower(value) + "%"
-		query = query.Where("LOWER(request_id) LIKE ? OR LOWER(model_public_id) LIKE ? OR LOWER(model_upstream_model) LIKE ? OR LOWER(egress_node_name) LIKE ?", pattern, pattern, pattern, pattern)
+		query = query.Where("LOWER(request_id) LIKE ? OR LOWER(model_public_id) LIKE ? OR LOWER(model_upstream_model) LIKE ? OR LOWER(egress_node_name) LIKE ? OR LOWER(account_name) LIKE ? OR CAST(account_id AS TEXT) LIKE ?", pattern, pattern, pattern, pattern, pattern, pattern)
 	}
 	if !start.IsZero() {
 		query = query.Where("created_at >= ?", start)

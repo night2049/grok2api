@@ -70,7 +70,7 @@ func normalizedConfig(cfg Config) Config {
 		cfg.QuotaTimeoutSeconds = 25
 	}
 	if cfg.ChatTimeoutSeconds <= 0 {
-		cfg.ChatTimeoutSeconds = 120
+		cfg.ChatTimeoutSeconds = 300
 	}
 	if cfg.ImageTimeoutSeconds <= 0 {
 		cfg.ImageTimeoutSeconds = 180

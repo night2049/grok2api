@@ -12,7 +12,7 @@ const positiveInteger = z.number().int().positive();
 const byteSizeSchema = z.object({ value: z.number().positive(), unit: z.enum(["MiB", "GiB"]) });
 const routingTTLDuration = durationSchema.refine((value) => durationSeconds(value) <= 30 * 86_400);
 const routingCooldownDuration = durationSchema.refine((value) => durationSeconds(value) <= 86_400);
-const routingCapacityWaitDuration = durationSchema.refine((value) => durationSeconds(value) <= 5);
+const routingCapacityWaitDuration = durationSchema.refine((value) => durationSeconds(value) <= 30);
 const auditFlushDuration = durationSchema.refine((value) => {
   const seconds = durationSeconds(value);
   return seconds >= 0.01 && seconds <= 60;
@@ -122,7 +122,7 @@ export const settingsSchema = z.object({
     cooldownBase: routingCooldownDuration,
     cooldownMax: routingCooldownDuration,
     capacityWait: routingCapacityWaitDuration,
-    maxAttempts: positiveInteger.max(10),
+    maxAttempts: positiveInteger.max(65535),
     preferFreeBuild: z.boolean(),
     segmentedSelector: z.object({
       enabled: z.boolean(),

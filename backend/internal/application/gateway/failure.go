@@ -2,7 +2,6 @@ package gateway
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -10,6 +9,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	neterrorpkg "github.com/chenyme/grok2api/backend/internal/pkg/neterror"
 )
 
@@ -27,10 +27,13 @@ type UpstreamFailure struct {
 	QuotaExhausted         bool
 	FreeQuotaExhausted     bool
 	ModelQuotaExhausted    bool
-	CredentialRejected     bool
-	Fingerprint            string
-	RetryAfter             time.Duration
-	Cause                  error
+	// SpendingLimitBlocked 表示付费账号被 spending-limit 永久阻断（402 personal-team-blocked:spending-limit），
+	// 账单周期内不会自动恢复，适合直接标 reauthRequired 出池。
+	SpendingLimitBlocked bool
+	CredentialRejected   bool
+	Fingerprint          string
+	RetryAfter           time.Duration
+	Cause                error
 }
 
 func (e *UpstreamFailure) Error() string {
@@ -111,6 +114,7 @@ func newHTTPUpstreamFailure(status int, body []byte, accountID uint64, accountNa
 		// spending-limit is account-scoped, but its paid/free recovery kind depends on
 		// the selected account's billing snapshot and must be decided by the selector.
 		failure.FreeQuotaExhausted = isFreeQuotaExhaustion(metadataText)
+		failure.SpendingLimitBlocked = isPaidQuotaExhaustion(metadataText)
 	case http.StatusForbidden:
 		failure.Code = "upstream_forbidden"
 		failure.PublicMessage = "上游拒绝了该请求"
@@ -119,6 +123,7 @@ func newHTTPUpstreamFailure(status int, body []byte, accountID uint64, accountNa
 		failure.ModelQuotaExhausted = isModelQuotaExhaustion(metadataText)
 		failure.FreeQuotaExhausted = failure.ModelQuotaExhausted || isFreeQuotaExhaustion(metadataText)
 		failure.QuotaExhausted = failure.FreeQuotaExhausted || isPaidQuotaExhaustion(metadataText)
+		failure.SpendingLimitBlocked = isPaidQuotaExhaustion(metadataText)
 		failure.CredentialRejected = !failure.QuotaExhausted && containsAny(metadataText, "authentication", "unauthorized", "invalid token", "token expired")
 		failure.AccountScoped = failure.AccountBlocked || failure.PermanentAccountDenial || failure.QuotaExhausted || failure.CredentialRejected || isAccountScopedForbidden(metadataText)
 	case http.StatusTooManyRequests:
@@ -162,36 +167,15 @@ func newCredentialUpstreamFailure(err error, accountID uint64, accountName strin
 }
 
 func extractUpstreamErrorMetadata(body []byte) (string, string, string) {
-	if len(body) == 0 {
-		return "", "", ""
-	}
-	var payload any
-	if json.Unmarshal(body, &payload) != nil {
-		return "", "", strings.TrimSpace(string(body))
-	}
-	root, ok := payload.(map[string]any)
-	if !ok {
-		return "", "", ""
-	}
-	if nested, ok := root["error"].(map[string]any); ok {
-		code := firstNonEmptyFailure(firstStringValue(nested, "code", "error_code"), firstStringValue(root, "code", "error_code"))
-		errorType := firstNonEmptyFailure(firstStringValue(nested, "type", "error_type"), firstStringValue(root, "type", "error_type"))
-		message := firstNonEmptyFailure(firstStringValue(nested, "message", "error"), firstStringValue(root, "message"))
-		return code, errorType, message
-	}
-	message := firstNonEmptyFailure(firstStringValue(root, "error"), firstStringValue(root, "message"))
-	return firstStringValue(root, "code", "error_code"), firstStringValue(root, "type", "error_type"), message
+	return provider.ExtractUpstreamErrorMetadata(body)
 }
 
 func isAccountScopedForbidden(text string) bool {
-	return containsAny(text, "quota", "billing", "subscription", "entitlement", "permission", "unauthorized", "authentication", "token", "usage-exhausted", "insufficient", "spending-limit")
+	return provider.ContainsAny(text, "quota", "billing", "subscription", "entitlement", "permission", "unauthorized", "authentication", "token", "usage-exhausted", "insufficient", "spending-limit")
 }
 
 func isPermanentAccountDenial(text string) bool {
-	if containsAny(text, "permission-denied", "permission_denied", "access to the chat endpoint is denied") {
-		return true
-	}
-	return strings.Trim(strings.TrimSpace(text), " .!\t\r\n") == "access denied"
+	return provider.IsPermanentAccountDenial(text)
 }
 
 func isDefinitiveAccountBlock(text string) bool {
@@ -203,7 +187,7 @@ func isPaidQuotaExhaustion(text string) bool {
 }
 
 func isFreeQuotaExhaustion(text string) bool {
-	return containsAny(text, "subscription:free-usage-exhausted", "used all the included free usage for model")
+	return provider.ContainsAny(text, "subscription:free-usage-exhausted", "used all the included free usage for model")
 }
 
 func isModelQuotaExhaustion(text string) bool {
@@ -211,30 +195,11 @@ func isModelQuotaExhaustion(text string) bool {
 }
 
 func containsAny(text string, signals ...string) bool {
-	for _, signal := range signals {
-		if strings.Contains(text, signal) {
-			return true
-		}
-	}
-	return false
-}
-
-func firstStringValue(values map[string]any, keys ...string) string {
-	for _, key := range keys {
-		if value, ok := values[key].(string); ok {
-			return strings.TrimSpace(value)
-		}
-	}
-	return ""
+	return provider.ContainsAny(text, signals...)
 }
 
 func firstNonEmptyFailure(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return value
-		}
-	}
-	return ""
+	return provider.FirstNonEmptyFailure(values...)
 }
 
 func normalizeFailureCode(value string) string {

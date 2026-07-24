@@ -64,7 +64,7 @@ func newPinnedHTTPSClient(proxyURL, serverName string, tlsConfig *tls.Config) (*
 		DisableKeepAlives:     true,
 		TLSClientConfig:       tlsConfig,
 		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
+		ResponseHeaderTimeout: 90 * time.Second,
 		ExpectContinueTimeout: time.Second,
 	}
 	if strings.TrimSpace(proxyURL) != "" {

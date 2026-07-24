@@ -45,3 +45,6 @@ Thumbs.db
 /release/
 /.tmp/
 /tmp/
+
+# Local ship script (not for repo)
+/scripts/ship.ps1

@@ -189,9 +189,10 @@ export function RequestAuditsPage() {
         {auditsQuery.isError ? <ErrorState message={auditsQuery.error.message} onRetry={() => void auditsQuery.refetch()} /> : null}
         {result && result.items.length === 0 ? <EmptyState /> : null}
         {auditsQuery.isPending || (result && result.items.length > 0) ? (
-          <Table viewportRows={20} rowHeight={72} aria-busy={auditsQuery.isFetching} className={cn("min-w-[1136px] table-fixed text-xs transition-opacity", auditsQuery.isPlaceholderData && "pointer-events-none opacity-60")}>
+          <Table viewportRows={20} rowHeight={72} className="min-w-[1240px] table-fixed text-xs">
             <colgroup>
               <col className="w-36" />
+              <col className="w-28" />
               <col className="w-44" />
               <col className="w-20" />
               <col className="w-24" />
@@ -203,6 +204,7 @@ export function RequestAuditsPage() {
             <TableHeader>
               <TableRow className="hover:bg-transparent">
                 <SortableTableHead field="request" sortBy={sort.field} sortOrder={sort.order} onSort={changeSort}>{t("audits.request")}</SortableTableHead>
+                <TableHead>{t("audits.account")}</TableHead>
                 <SortableTableHead field="model" sortBy={sort.field} sortOrder={sort.order} onSort={changeSort}>{t("audits.model")}</SortableTableHead>
                 <TableHead>{t("audits.egress")}</TableHead>
                 <SortableTableHead field="billing" sortBy={sort.field} sortOrder={sort.order} initialOrder="desc" onSort={changeSort}>{t("audits.billing")}</SortableTableHead>
@@ -213,9 +215,27 @@ export function RequestAuditsPage() {
               </TableRow>
             </TableHeader>
             {auditsQuery.isPending ? (
-              <TableBody><TableLoadingRow colSpan={8} /></TableBody>
+              <TableBody><TableLoadingRow colSpan={9} /></TableBody>
             ) : (
-              <VirtualTableBody items={result?.items ?? []} colSpan={8} rowHeight={72} overscan={6} renderRow={renderAuditRow} />
+              <VirtualTableBody items={result?.items ?? []} colSpan={9} rowHeight={72} renderRow={(audit) => (
+                <TableRow className="h-[72px]" key={audit.id}>
+                  <TableCell><RequestValue audit={audit} /></TableCell>
+                  <TableCell><AccountValue audit={audit} /></TableCell>
+                  <TableCell>
+                    <ModelRouteValue
+                      model={audit.modelPublicId || `#${audit.modelRouteId}`}
+                      upstreamModel={audit.modelUpstreamModel || "-"}
+                      clientKey={audit.clientKeyName || `#${audit.clientKeyId}`}
+                    />
+                  </TableCell>
+                  <TableCell><EgressValue audit={audit} /></TableCell>
+                  <TableCell><BillingValue audit={audit} /></TableCell>
+                  <TableCell className="px-3"><UsageDetails audit={audit} locale={i18n.language} /></TableCell>
+                  <TableCell className="text-center"><AuditStatus audit={audit} onOpen={() => setSelectedAudit(audit)} /></TableCell>
+                  <TableCell className="whitespace-nowrap text-xs tabular-nums">{formatDuration(audit.durationMs)}</TableCell>
+                  <TableCell className="whitespace-nowrap text-xs text-muted-foreground">{formatDateTime(audit.createdAt, i18n.language)}</TableCell>
+                </TableRow>
+              )} />
             )}
           </Table>
         ) : null}
@@ -345,7 +365,21 @@ function AuditTokenMetric({ icon: Icon, label, value, loading }: { icon: LucideI
   );
 }
 
-function ModelRouteValue({ model, upstreamModel, account, clientKey }: { model: string; upstreamModel: string; account: string; clientKey: string }) {
+function AccountValue({ audit }: { audit: AuditDTO }) {
+  const name = audit.accountName?.trim();
+  const id = audit.accountId;
+  if (!name && !id) {
+    return <span className="text-muted-foreground">-</span>;
+  }
+  return (
+    <div className="min-w-0">
+      <span className="block truncate text-xs font-medium" title={name || `#${id}`}>{name || `#${id}`}</span>
+      {name && id ? <span className="mt-0.5 block truncate font-mono text-[10px] text-muted-foreground" title={`#${id}`}>#{id}</span> : null}
+    </div>
+  );
+}
+
+function ModelRouteValue({ model, upstreamModel, clientKey }: { model: string; upstreamModel: string; clientKey: string }) {
   const { t } = useTranslation();
   return (
     <Tooltip>
@@ -359,10 +393,6 @@ function ModelRouteValue({ model, upstreamModel, account, clientKey }: { model: 
         </button>
       </TooltipTrigger>
       <TooltipContent className="w-64 space-y-1.5 py-2" side="top" align="start">
-        <div className="grid grid-cols-[auto_1fr] gap-x-3">
-          <span className="text-primary-foreground/65">{t("audits.owningAccount")}</span>
-          <span className="truncate text-right" title={account}>{account}</span>
-        </div>
         <div className="grid grid-cols-[auto_1fr] gap-x-3">
           <span className="text-primary-foreground/65">{t("audits.owningKey")}</span>
           <span className="truncate text-right" title={clientKey}>{clientKey}</span>

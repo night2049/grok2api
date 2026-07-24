@@ -41,6 +41,7 @@ import {
   deleteAccounts,
   enableWebAccountNSFW,
   convertWebAccountsToBuild,
+  detectBuildAccounts,
   exportAccounts,
   getAccountSummary,
   importAccounts,
@@ -71,6 +72,7 @@ import {
   type AccountTaskProgressDTO,
   type BuildConversionInput,
   type BuildConversionStrategy,
+  type BuildDetectItemDTO,
   type WebConsoleSyncInput,
   type WebAccountScriptActions,
   type WebAccountScriptsInput,
@@ -105,6 +107,7 @@ export function AccountsPage() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const quickImportFileInputRef = useRef<HTMLInputElement>(null);
   const quotaSyncAbortRef = useRef<AbortController | null>(null);
+  const detectAbortRef = useRef<AbortController | null>(null);
   const renewalAbortRef = useRef<AbortController | null>(null);
   const conversionAbortRef = useRef<AbortController | null>(null);
   const webConsoleSyncAbortRef = useRef<AbortController | null>(null);
@@ -131,7 +134,11 @@ export function AccountsPage() {
   const [cleanupStatuses, setCleanupStatuses] = useState<Set<AccountCleanupStatus>>(() => new Set());
   const [exportOpen, setExportOpen] = useState(false);
   const [syncAllOpen, setSyncAllOpen] = useState(false);
+  const [detectDialogOpen, setDetectDialogOpen] = useState(false);
+  const [detectMode, setDetectMode] = useState<"selected" | "all">("all");
   const [quotaSyncProgress, setQuotaSyncProgress] = useState<AccountTaskProgressDTO | null>(null);
+  const [detectProgress, setDetectProgress] = useState<AccountTaskProgressDTO | null>(null);
+  const [detectItems, setDetectItems] = useState<BuildDetectItemDTO[]>([]);
   const [webConversionTargets, setWebConversionTargets] = useState<string[] | "all" | null>(null);
   const [webConversionTarget, setWebConversionTarget] = useState<WebConversionTarget>("build");
   const [webConversionStrategy, setWebConversionStrategy] = useState<BuildConversionStrategy>("missing");
@@ -153,6 +160,7 @@ export function AccountsPage() {
 
   useEffect(() => () => {
     quotaSyncAbortRef.current?.abort();
+    detectAbortRef.current?.abort();
     renewalAbortRef.current?.abort();
     conversionAbortRef.current?.abort();
     webConsoleSyncAbortRef.current?.abort();
@@ -467,6 +475,59 @@ export function AccountsPage() {
     onError: showError,
   });
 
+  const appendDetectItem = useCallback((item: BuildDetectItemDTO) => {
+    setDetectItems((prev) => {
+      const next = prev.filter((entry) => entry.id !== item.id);
+      next.unshift(item);
+      return next.slice(0, 200);
+    });
+  }, []);
+
+  const detectMutation = useMutation({
+    mutationFn: (mode: "selected" | "all") => {
+      const controller = new AbortController();
+      detectAbortRef.current = controller;
+      setDetectProgress(null);
+      setDetectItems([]);
+      const handlers = {
+        onProgress: setDetectProgress,
+        onItem: appendDetectItem,
+      };
+      if (mode === "all") {
+        return detectBuildAccounts({ all: true }, handlers, controller.signal);
+      }
+      return detectBuildAccounts({ ids: [...selected] }, handlers, controller.signal);
+    },
+    onSuccess: (result, mode) => {
+      if (mode === "selected") clearSelection();
+      toast.success(t(mode === "all" ? "accounts.allDetected" : "accounts.batchDetected", result));
+    },
+    onError: (error) => { if (!isAbortError(error)) showError(error); },
+    onSettled: () => {
+      detectAbortRef.current = null;
+      invalidateAccountData();
+    },
+  });
+
+  const openDetectDialog = (mode: "selected" | "all") => {
+    setDetectMode(mode);
+    setDetectProgress(null);
+    setDetectItems([]);
+    setDetectDialogOpen(true);
+  };
+
+  const closeDetectDialog = (open: boolean) => {
+    if (!open) {
+      if (detectMutation.isPending) detectAbortRef.current?.abort();
+      setDetectDialogOpen(false);
+      setDetectProgress(null);
+      // 保留结果列表直到下次打开，便于查看完成摘要；关闭后清空避免残留。
+      if (!detectMutation.isPending) setDetectItems([]);
+      return;
+    }
+    setDetectDialogOpen(true);
+  };
+
   const batchTokenMutation = useMutation({
     mutationFn: () => refreshAccountsTokens([...selected], provider),
     onSuccess: (result) => {
@@ -729,6 +790,7 @@ export function AccountsPage() {
     || importMutation.isPending
     || batchUpdateMutation.isPending
     || batchBillingMutation.isPending
+    || detectMutation.isPending
     || batchTokenMutation.isPending
     || batchDeleteMutation.isPending
     || bindEgressMutation.isPending
@@ -736,6 +798,9 @@ export function AccountsPage() {
     || cleanupMutation.isPending
     || webConfirmationMutation.isPending
     || webAccountScriptsMutation.isPending;
+
+  const detectInvalidItems = detectItems.filter((item) => item.outcome === "invalid");
+  const detectVisibleItems = detectMode === "selected" ? detectItems : detectInvalidItems;
 
   return (
     <div className="space-y-5">
@@ -875,6 +940,7 @@ export function AccountsPage() {
                 <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => unbindEgressMutation.mutate()}><Unlink />{t("accounts.unbindEgress")}</Button>
                 {provider === "grok_web" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => openWebConversion([...selected])}>{t("accountConversion.action")}</Button> : null}
                 {provider === "grok_web" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => setWebAccountScriptsTargets([...selected])}>{t("webAccountScripts.action")}</Button> : null}
+                {provider === "grok_build" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => openDetectDialog("selected")}>{t("accountCredential.detectAction")}</Button> : null}
                 <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => batchBillingMutation.mutate()}>{t("accountCredential.quotaSyncAction")}</Button>
                 {provider === "grok_build" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => batchTokenMutation.mutate()}>{t("accountCredential.refreshAction")}</Button> : null}
                 <Button variant="secondary" size="sm" className="bg-destructive/10 text-destructive hover:bg-destructive/15 hover:text-destructive" disabled={bulkTaskPending} onClick={() => setBatchDeleteOpen(true)}>{t("common.delete")}</Button>
@@ -883,6 +949,7 @@ export function AccountsPage() {
               <div className="flex flex-wrap items-center justify-end gap-1.5">
                 {provider === "grok_web" && hasProviderAccounts ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => openWebConversion("all")}>{t("accountConversion.action")}</Button> : null}
                 {provider === "grok_web" && hasProviderAccounts ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => setWebAccountScriptsTargets("all")}>{t("webAccountScripts.action")}</Button> : null}
+                {hasProviderAccounts && provider === "grok_build" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => openDetectDialog("all")}>{t("accountCredential.detectAction")}</Button> : null}
                 {hasProviderAccounts ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => setSyncAllOpen(true)}>{t("accountCredential.quotaSyncAction")}</Button> : null}
                 {hasProviderAccounts && provider === "grok_build" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => setRenewAllOpen(true)}>{t("accountCredential.refreshAction")}</Button> : null}
                 {hasProviderAccounts ? <Button variant="secondary" size="sm" className="bg-destructive/10 text-destructive hover:bg-destructive/15 hover:text-destructive" disabled={bulkTaskPending} onClick={() => { setCleanupStatuses(new Set()); setCleanupOpen(true); }}><Trash2 />{t("accounts.cleanupAction")}</Button> : null}
@@ -996,6 +1063,83 @@ export function AccountsPage() {
           <AlertDialogFooter><AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel><AlertDialogAction disabled={quotaSyncMutation.isPending} onClick={(event) => { event.preventDefault(); quotaSyncMutation.mutate(provider); }}>{quotaSyncMutation.isPending ? <><Spinner />{quotaSyncProgress ? <span className="tabular-nums">{quotaSyncProgress.completed} / {quotaSyncProgress.total}</span> : t("common.loading")}</> : t("accounts.syncAll")}</AlertDialogAction></AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      <Dialog open={detectDialogOpen} onOpenChange={closeDetectDialog}>
+        <DialogContent className="max-w-xl gap-4 sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>{detectMode === "all" ? t("accounts.detectAllTitle") : t("accounts.detectSelectedTitle", { count: selected.size })}</DialogTitle>
+            <DialogDescription>{detectMode === "all" ? t("accounts.detectAllDescription") : t("accounts.detectSelectedDescription", { count: selected.size })}</DialogDescription>
+          </DialogHeader>
+          {(detectMutation.isPending || detectProgress || detectVisibleItems.length > 0) ? (
+            <div className="space-y-3">
+              <div className="flex items-center justify-between gap-3 rounded-md border bg-muted/30 px-3 py-2 text-sm">
+                <span className="text-muted-foreground">{t("accounts.detectProgressLabel")}</span>
+                <span className="tabular-nums font-medium">
+                  {detectProgress ? `${detectProgress.completed} / ${detectProgress.total}` : detectMutation.isPending ? t("common.loading") : "—"}
+                </span>
+              </div>
+              {detectMode === "all" && detectInvalidItems.length > 0 ? (
+                <p className="text-xs text-muted-foreground">{t("accounts.detectInvalidCount", { count: detectInvalidItems.length })}</p>
+              ) : null}
+              {detectMode === "selected" && detectItems.length > 0 ? (
+                <p className="text-xs text-muted-foreground">
+                  {t("accounts.detectSelectedSummary", {
+                    ok: detectItems.filter((item) => item.outcome === "ok").length,
+                    invalid: detectItems.filter((item) => item.outcome === "invalid").length,
+                    failed: detectItems.filter((item) => item.outcome === "failed").length,
+                  })}
+                </p>
+              ) : null}
+              <div className="max-h-64 overflow-y-auto rounded-md border">
+                {detectVisibleItems.length === 0 ? (
+                  <div className="px-3 py-6 text-center text-sm text-muted-foreground">
+                    {detectMutation.isPending
+                      ? t(detectMode === "all" ? "accounts.detectWaitingInvalid" : "accounts.detectWaitingResults")
+                      : t(detectMode === "all" ? "accounts.detectNoInvalid" : "accounts.detectNoResults")}
+                  </div>
+                ) : (
+                  <ul className="divide-y">
+                    {detectVisibleItems.map((item) => (
+                      <li key={`${item.id}-${item.outcome}-${item.reason ?? ""}`} className="flex items-start gap-3 px-3 py-2 text-sm">
+                        <Badge
+                          variant="outline"
+                          className={cn(
+                            "mt-0.5 shrink-0",
+                            item.outcome === "ok" && "border-emerald-500/40 text-emerald-700 dark:text-emerald-300",
+                            item.outcome === "invalid" && "border-destructive/40 text-destructive",
+                            item.outcome === "failed" && "border-amber-500/40 text-amber-700 dark:text-amber-300",
+                          )}
+                        >
+                          {t(`accounts.detectOutcome.${item.outcome}`)}
+                        </Badge>
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate font-medium">{item.name || item.id}</div>
+                          {item.email ? <div className="truncate text-xs text-muted-foreground">{item.email}</div> : null}
+                          {item.reason ? <div className="mt-0.5 break-all text-xs text-muted-foreground">{item.reason}</div> : null}
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            </div>
+          ) : null}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => closeDetectDialog(false)}>{detectMutation.isPending ? t("common.cancel") : t("common.close")}</Button>
+            <Button
+              disabled={detectMutation.isPending || (detectMode === "selected" && selected.size === 0)}
+              onClick={() => detectMutation.mutate(detectMode)}
+            >
+              {detectMutation.isPending ? (
+                <>
+                  <Spinner />
+                  {detectProgress ? <span className="tabular-nums">{detectProgress.completed} / {detectProgress.total}</span> : t("common.loading")}
+                </>
+              ) : t("accounts.detectAll")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <AlertDialog open={webConversionTargets !== null} onOpenChange={(open) => { if (!open) closeWebConversion(); }}>
         <AlertDialogContent>

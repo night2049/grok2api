@@ -3,8 +3,8 @@ package clientkey
 import "time"
 
 const (
-	DefaultRPMLimit      = 120
-	DefaultMaxConcurrent = 8
+	DefaultRPMLimit      = 600
+	DefaultMaxConcurrent = 32
 	MaxRPMLimit          = 100000
 	MaxConcurrent        = 1024
 	MaxBillingLimitTicks = 9_000_000_000_000_000

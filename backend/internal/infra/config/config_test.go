@@ -168,6 +168,38 @@ routing:
 	}
 }
 
+func TestRoutingMaxAttemptsSupportsLargeCredentialPools(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Secrets.JWTSecret = "12345678901234567890123456789012"
+	cfg.Secrets.CredentialEncryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	if cfg.Routing.MaxAttempts != 999 {
+		t.Fatalf("default max attempts = %d, want 999", cfg.Routing.MaxAttempts)
+	}
+	if cfg.Routing.CapacityWait.Value() != 500*time.Millisecond {
+		t.Fatalf("default capacity wait = %s, want 500ms", cfg.Routing.CapacityWait.Value())
+	}
+	if cfg.Provider.Web.ChatTimeout.Value() != 5*time.Minute {
+		t.Fatalf("default web chat timeout = %s, want 5m", cfg.Provider.Web.ChatTimeout.Value())
+	}
+	cfg.Routing.MaxAttempts = 65535
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("65535 attempts should be valid: %v", err)
+	}
+	cfg.Routing.MaxAttempts = 65536
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("65536 attempts should be rejected")
+	}
+	cfg.Routing.MaxAttempts = 999
+	cfg.Routing.CapacityWait = Duration(30 * time.Second)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("30s capacity wait should be valid: %v", err)
+	}
+	cfg.Routing.CapacityWait = Duration(31 * time.Second)
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("31s capacity wait should be rejected")
+	}
+}
+
 func TestValidateRejectsInvalidSegmentedSelectorConfig(t *testing.T) {
 	tests := []func(*RoutingConfig){
 		func(value *RoutingConfig) { value.SegmentedMinCandidates = 99 },

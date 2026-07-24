@@ -322,6 +322,41 @@ func TestLoadPersistedBackfillsMissingServerConcurrency(t *testing.T) {
 	}
 }
 
+func TestApplyDomainConfigMigratesLegacyHotDefaults(t *testing.T) {
+	base := testConfig(t)
+	value := toDomainConfig(base)
+	value.Server.MaxConcurrentRequests = 1024
+	value.Routing.CapacityWait = 500 * time.Millisecond
+	value.ProviderWeb.ChatTimeout = 2 * time.Minute
+	value.ClientKeyDefaults.RPMLimit = 120
+	value.ClientKeyDefaults.MaxConcurrent = 8
+
+	applied := applyDomainConfig(base, value)
+	if applied.Server.MaxConcurrentRequests != 2048 {
+		t.Fatalf("maxConcurrentRequests = %d, want 2048", applied.Server.MaxConcurrentRequests)
+	}
+	if applied.Routing.CapacityWait.Value() != 500*time.Millisecond {
+		t.Fatalf("capacityWait = %s, want 500ms", applied.Routing.CapacityWait.Value())
+	}
+	if applied.Provider.Web.ChatTimeout.Value() != 5*time.Minute {
+		t.Fatalf("chatTimeout = %s, want 5m", applied.Provider.Web.ChatTimeout.Value())
+	}
+	if applied.ClientKeyDefaults.RPMLimit != 600 || applied.ClientKeyDefaults.MaxConcurrent != 32 {
+		t.Fatalf("client key defaults = %+v, want 600/32", applied.ClientKeyDefaults)
+	}
+
+	// 用户显式调高的值不应被迁移逻辑覆盖。
+	value.Server.MaxConcurrentRequests = 4096
+	value.Routing.CapacityWait = 10 * time.Second
+	value.ProviderWeb.ChatTimeout = 8 * time.Minute
+	value.ClientKeyDefaults.RPMLimit = 1000
+	value.ClientKeyDefaults.MaxConcurrent = 64
+	custom := applyDomainConfig(base, value)
+	if custom.Server.MaxConcurrentRequests != 4096 || custom.Routing.CapacityWait.Value() != 10*time.Second || custom.Provider.Web.ChatTimeout.Value() != 8*time.Minute || custom.ClientKeyDefaults.RPMLimit != 1000 || custom.ClientKeyDefaults.MaxConcurrent != 64 {
+		t.Fatalf("custom values were rewritten: server=%d capacity=%s chat=%s key=%+v", custom.Server.MaxConcurrentRequests, custom.Routing.CapacityWait.Value(), custom.Provider.Web.ChatTimeout.Value(), custom.ClientKeyDefaults)
+	}
+}
+
 func TestLoadPersistedBackfillsMissingConsoleSection(t *testing.T) {
 	cfg := testConfig(t)
 	value := toDomainConfig(cfg)
@@ -469,6 +504,7 @@ func TestApplyDomainConfigAccountsDefaults(t *testing.T) {
 			StickyTTL: base.Routing.StickyTTL.Value(), CooldownBase: base.Routing.CooldownBase.Value(),
 			CooldownMax: base.Routing.CooldownMax.Value(), CapacityWait: base.Routing.CapacityWait.Value(),
 			MaxAttempts: base.Routing.MaxAttempts, PreferFreeBuild: base.Routing.PreferFreeBuild,
+			MarkBuildChatDeniedAsReauth: base.Routing.MarkBuildChatDeniedAsReauth,
 		},
 		Audit: settingsdomain.AuditConfig{
 			BufferSize: base.Audit.BufferSize, BatchSize: base.Audit.BatchSize, FlushInterval: base.Audit.FlushInterval.Value(),
